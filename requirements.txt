@@ -1,0 +1,8 @@
+streamlit>=1.50.0
+yfinance>=0.2.54
+pandas>=2.0
+numpy>=1.24
+plotly>=5.20
+openpyxl>=3.1
+requests>=2.31
+vaderSentiment>=3.3.2

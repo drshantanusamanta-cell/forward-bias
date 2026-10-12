@@ -386,7 +386,7 @@ def single_tab(gsec, fin_mode, tl, eq, fo, use_news):
         kpi("Data coverage", f"{res['coverage']:.0f}%" if isnum(res["coverage"]) else "–", "share of matrix weight with data",
             TEAL if isnum(res["coverage"]) and res["coverage"] >= 60 else "#e67e22"),
         kpi("Price", f"₹{snap.price:,.2f}", "last close (Yahoo)"),
-        kpi("Expected EPS growth", pct(d.get("fwd_growth"), 1), "current-FY consensus vs TTM", growth_colour(d.get("fwd_growth"))),
+        kpi("Expected EPS growth", pct(d.get("fwd_growth"), 1), f"consensus vs {d.get('growth_base') or 'base'} EPS", growth_colour(d.get("fwd_growth"))),
         kpi("Analyst target upside", pct(snap.values.get("G1"), 1),
             f"{int(d['target_analysts'])} analysts" if isnum(d.get("target_analysts")) else "too few analysts",
             band(snap.values.get("G1"))[1] if isnum(snap.values.get("G1")) else None),
@@ -688,9 +688,19 @@ def method_tab():
                    "Total possible weight varies, so scores are always shown as a % of the weight that applied.")
     st.markdown("""
 #### 🚀 Forward growth × PEG grid
-Growth = current-fiscal-year consensus EPS ÷ TTM EPS − 1. PEG = forward PE ÷ growth %.
-Growth above 15% adds +50%, below 5% adds −50%; PEG below 1 adds +50%, above 2 adds −50% (only when growth is positive);
-falling earnings add a further −50%. The result is capped at ±100%.
+**Growth** = current-fiscal-year consensus EPS ÷ last full fiscal year's actual EPS − 1 (Yahoo). This is like-for-like and does not
+drift through the year. If the year-ago figure is missing or looks inconsistent (outside 0.4–2.5× TTM EPS), TTM EPS is used instead.
+With a Trendlyne file, its 1-year-forward EPS is compared with Trendlyne TTM EPS on Trendlyne's own basis. The metric card shows which base was used.
+**Forward PE** = price ÷ the same forward EPS. **PEG** = forward PE ÷ growth %.
+
+| Growth | PEG < 1 | PEG 1–2 | PEG > 2 |
+|---|---|---|---|
+| above 15% | **+100%** | +50% | 0% |
+| 5% to 15% | +50% | 0% | −50% |
+| 0% to 5% | 0% | −50% | **−100%** |
+| zero or falling | **−100%** (PEG not used) | | |
+
+Companies with zero or negative base EPS (loss-makers, turnarounds) get no score on this metric — it is left out and the rest re-weighted.
 
 #### 🧑‍💼 Analyst-conviction metrics (Yahoo)
 **G9** rating drift (Buy share now vs 3 months ago, ±5 points) · **G10** earnings beats in the last 4 quarters ·

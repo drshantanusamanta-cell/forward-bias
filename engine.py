@@ -228,9 +228,10 @@ def build(raw: dict, idx: pd.DataFrame | None, gsec: float, fin_override: str = 
 
     # ── Forward & growth
     est, trend = raw.get("est"), raw.get("trend")
-    fwd_eps = n_an = rev90 = None
+    fwd_eps = n_an = rev90 = year_ago_eps = None
     if est is not None and len(est) and "0y" in est.index:
         fwd_eps = nz(float(est.loc["0y", "avg"])) if "avg" in est.columns else None
+        year_ago_eps = nz(float(est.loc["0y", "yearAgoEps"])) if "yearAgoEps" in est.columns else None
         n_an = nz(float(est.loc["0y", "numberOfAnalysts"])) if "numberOfAnalysts" in est.columns else None
     if trend is not None and len(trend) and "0y" in trend.index:
         s.eps_trend = trend
@@ -252,19 +253,33 @@ def build(raw: dict, idx: pd.DataFrame | None, gsec: float, fin_override: str = 
     elif ok(tgt):
         N["G1"] = f"Only {int(n_tgt or 0)} analysts — ignored (needs 3+)"
 
-    if ok(fwd_eps) and ok(eps_ttm) and eps_ttm > 0:
-        g = (fwd_eps / eps_ttm - 1) * 100
+    # Growth base. Yahoo: current-FY consensus vs LAST FULL FY actual EPS (like-for-like, does not drift through the
+    # year as TTM does). Falls back to TTM when the year-ago figure is missing or implausible (outside 0.4–2.5× TTM).
+    # Trendlyne: its "1Y forward EPS" is a forward-12-month figure, so TTM is the matching base.
+    base_eps, base_lab = None, None
+    if fwd_src == "yfinance" and ok(year_ago_eps) and year_ago_eps > 0 and \
+            (not ok(eps_ttm) or eps_ttm <= 0 or 0.4 <= year_ago_eps / eps_ttm <= 2.5):
+        base_eps, base_lab = year_ago_eps, "last FY actual"
+    elif ok(eps_ttm) and eps_ttm > 0:
+        base_eps, base_lab = eps_ttm, "TTM"
+        if fwd_src == "yfinance" and ok(year_ago_eps):
+            N["GX_fallback"] = True
+    if ok(fwd_eps) and base_eps:
+        g = (fwd_eps / base_eps - 1) * 100
         fpe = s.price / fwd_eps if fwd_eps > 0 else None
         peg = fpe / g if (fpe and g > 0) else None
         gp_ = 0.5 if g > 15 else (-0.5 if g < 5 else 0.0)
         pp_ = 0.0
         if g > 0 and peg is not None:
             pp_ = 0.5 if peg < 1 else (-0.5 if peg > 2 else 0.0)
-        grid = gp_ + pp_ - (0.5 if g < 0 else 0.0)
+        grid = gp_ + pp_ - (0.5 if g <= 0 else 0.0)     # flat or falling earnings → −100%
         grid = max(-1.0, min(1.0, grid))
         V["GX"] = grid; SRC["GX"] = fwd_src
-        N["GX"] = f"Current-FY EPS est {fwd_eps:.2f} vs TTM {eps_ttm:.2f} → growth {g:+.1f}%, fwd PE {fpe:.1f}" + (f", PEG {peg:.2f}" if peg else ", PEG n/a") if fpe else f"Growth {g:+.1f}%"
-        s.data.update(dict(fwd_growth=g, fwd_pe=fpe, peg=peg))
+        fb = " (year-ago EPS looked inconsistent, used TTM)" if N.pop("GX_fallback", False) else ""
+        N["GX"] = (f"{'Fwd' if fwd_src == 'Trendlyne' else 'Current-FY'} EPS est {fwd_eps:.2f} vs {base_lab} {base_eps:.2f}{fb} → growth {g:+.1f}%"
+                   + (f", fwd PE {fpe:.1f}" if fpe else "") + (f", PEG {peg:.2f}" if peg else ", PEG n/a"))
+        s.data.update(dict(fwd_growth=g, fwd_pe=fpe, peg=peg, growth_base=base_lab, base_eps=base_eps))
+    N.pop("GX_fallback", None)
     if ok(rev90):
         V["G4"] = rev90; N["G4"] = f"Current-FY consensus EPS {trend.loc['0y','current']:.2f} vs {trend.loc['0y','90daysAgo']:.2f} 90 days ago"; SRC["G4"] = "yfinance"
 

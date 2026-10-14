@@ -166,8 +166,38 @@ def nse_data(eq_files, fo_files):
     return eq, fo
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_nse_list():
+    """NSE equity symbols + names from Dhan's public scrip master (no token needed)."""
+    return DHAN.load_nse_equities()
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
 def cached_scrip_master():
-    return DHAN.load_scrip_master()
+    return DHAN.load_scrip_master(cached_nse_list())
+
+def suggest_symbols(q: str, df: pd.DataFrame, n: int = 8) -> list:
+    """Closest NSE symbols for a mistyped symbol or a company name, best first.
+    Scores: symbol starts with text 100 · name starts with text 95 · every word in name 85 · symbol contains text 70 ·
+    fuzzy symbol / name similarity up to 60. ETFs and fund units (names with 'AMC') are pushed down."""
+    import difflib, re
+    q = q.upper().strip()
+    qs = q.replace(" ", "")
+    words = [w for w in re.split(r"[^A-Z0-9&]+", q) if w]
+    best = {}
+    for sym, nm in zip(df["SYMBOL"], df["NAME"].str.upper()):
+        sc = 0.0
+        if sym.startswith(qs): sc = 100
+        elif nm.startswith(q): sc = 95
+        elif words and all(w in nm or w in sym for w in words): sc = 85
+        elif qs in sym: sc = 70
+        else:
+            r = max(difflib.SequenceMatcher(None, qs, sym).ratio(), difflib.SequenceMatcher(None, q, nm[:len(q) + 6]).ratio())
+            if r >= 0.6: sc = r * 60
+        if sc:
+            if "AMC" in nm or "ETF" in nm: sc -= 40
+            best[sym] = sc - len(sym) * 0.01          # shorter symbol wins ties
+    names = dict(zip(df["SYMBOL"], df["NAME"]))
+    top = sorted(best, key=best.get, reverse=True)[:n]
+    return [(x, names.get(x, "")) for x in top]
 
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def cached_dhan(token: str, client_id: str, security_id: str):
@@ -402,11 +432,35 @@ def single_tab(gsec, fin_mode, tl, eq, fo, use_news):
     with st.form("scan_form", border=False):
         c1, c2 = st.columns([4, 1.3], vertical_alignment="bottom")
         tick = c1.text_input("NSE symbol", value=st.session_state.get("last_ticker", "TCS"),
-                             placeholder="e.g. TCS, HDFCBANK, SHRIRAMFIN", help="'.NS' is added automatically.")
+                             placeholder="e.g. TCS, HDFCBANK, or a company name", help="'.NS' is added automatically. If the text is not an NSE symbol, similar symbols are suggested.")
         go_btn = c2.form_submit_button("🔍 Scan", type="primary", width="stretch")
     if go_btn and tick.strip():
-        st.session_state["last_ticker"] = tick.strip().upper()
-        st.session_state["single"] = E.norm_ticker(tick)
+        q = tick.strip().upper()
+        q = q[:-3] if q.endswith(".NS") else q
+        st.session_state.pop("suggest", None)
+        try:
+            nse = cached_nse_list() if ("." not in q and not q.startswith("^")) else None
+        except Exception:
+            nse = None                                   # list unavailable → scan as typed
+        if nse is not None and q not in set(nse["SYMBOL"]):
+            st.session_state["suggest"] = (q, suggest_symbols(q, nse))
+        else:
+            st.session_state["last_ticker"] = q
+            st.session_state["single"] = E.norm_ticker(q)
+    if st.session_state.get("suggest"):
+        q, opts = st.session_state["suggest"]
+        if opts:
+            st.warning(f"**“{q}”** is not an NSE symbol. Did you mean one of these?")
+            cols = st.columns(2)
+            for i, (sym_, nm_) in enumerate(opts):
+                if cols[i % 2].button(f"{sym_} · {nm_.title()}" if nm_ else sym_, key=f"sugg_{sym_}", width="stretch"):
+                    st.session_state.pop("suggest", None)
+                    st.session_state["last_ticker"] = sym_
+                    st.session_state["single"] = E.norm_ticker(sym_)
+                    st.rerun()
+        else:
+            st.warning(f"**“{q}”** is not an NSE symbol and nothing similar was found. Try the company name, e.g. *tata motors*.")
+        return
     t = st.session_state.get("single")
     if not t:
         st.info("Type an NSE symbol and press **🔍 Scan**.")

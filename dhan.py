@@ -29,16 +29,27 @@ class DhanError(Exception):
     pass
 
 
-def load_scrip_master() -> dict:
-    """NSE cash-market symbol → securityId (EQ series preferred, BE as fallback)."""
+EQ_SERIES = ["EQ", "BE", "BZ", "SM", "ST", "SZ"]   # equity series (main board, trade-for-trade, SME)
+
+
+def load_nse_equities() -> pd.DataFrame:
+    """All NSE cash-market equities: SYMBOL, SID (Dhan securityId), NAME. One row per symbol, EQ series preferred."""
     r = requests.get(SCRIP_URL, timeout=60)
     r.raise_for_status()
-    cols = ["SEM_EXM_EXCH_ID", "SEM_SEGMENT", "SEM_SMST_SECURITY_ID", "SEM_TRADING_SYMBOL", "SEM_SERIES"]
+    cols = ["SEM_EXM_EXCH_ID", "SEM_SEGMENT", "SEM_SMST_SECURITY_ID", "SEM_TRADING_SYMBOL", "SEM_SERIES", "SM_SYMBOL_NAME"]
     d = pd.read_csv(io.BytesIO(r.content), usecols=cols, low_memory=False)
-    e = d[(d["SEM_EXM_EXCH_ID"] == "NSE") & (d["SEM_SEGMENT"] == "E") & (d["SEM_SERIES"].isin(["EQ", "BE"]))].copy()
-    e["rank"] = (e["SEM_SERIES"] != "EQ").astype(int)
+    e = d[(d["SEM_EXM_EXCH_ID"] == "NSE") & (d["SEM_SEGMENT"] == "E") & (d["SEM_SERIES"].isin(EQ_SERIES))].copy()
+    e["rank"] = e["SEM_SERIES"].map({k: i for i, k in enumerate(EQ_SERIES)})
     e = e.sort_values("rank").drop_duplicates("SEM_TRADING_SYMBOL")
-    return dict(zip(e["SEM_TRADING_SYMBOL"].astype(str).str.upper(), e["SEM_SMST_SECURITY_ID"].astype(str)))
+    return pd.DataFrame({"SYMBOL": e["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.strip(),
+                         "SID": e["SEM_SMST_SECURITY_ID"].astype(str),
+                         "NAME": e["SM_SYMBOL_NAME"].fillna("").astype(str).str.strip()}).reset_index(drop=True)
+
+
+def load_scrip_master(df: pd.DataFrame | None = None) -> dict:
+    """NSE symbol → Dhan securityId."""
+    df = load_nse_equities() if df is None else df
+    return dict(zip(df["SYMBOL"], df["SID"]))
 
 
 def _f(x):

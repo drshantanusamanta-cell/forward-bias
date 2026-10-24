@@ -47,6 +47,8 @@ On your first visit, read the disclaimer and tick *I have read, understood and a
 2. **Single company:** type an NSE symbol (e.g. `TCS`, `HDFCBANK`) and press **🔍 Scan**. You get colour-coded score tiles, a score gauge, pillar bars, a waterfall showing how much each pillar adds to the overall score, a data-coverage donut, metric cards with the reason for every score, detail charts (valuation band, EPS-estimate trend, analyst ratings, earnings surprises, target range, 200-DMA, news tone) and a CSV download.
 3. **Watchlist ranking:** paste up to 300 symbols, or upload a CSV with symbols in the first column, and press **Scan watchlist**. You get counts per colour band, a ranking bar chart, a pillar heat-map and a colour-coded table. Download the ranked table as CSV.
 
+4. **Portfolio:** upload your holdings as CSV or Excel (broker exports usually work; the app looks for a symbol, quantity and average-cost column and skips title rows). Fix any symbol the app flags under *Analyse as*, then press **🧮 Analyse portfolio**. You get a value-weighted portfolio score, a portfolio map, outlook and sector breakdowns, value-weighted pillars, a score-vs-P&L chart, a colour-coded holding table with mechanical flags, and CSV / colour-coded Excel downloads.
+
 **Trendlyne file tip:** include the **NSE code** column in your Trendlyne view. Without it the app matches by company name, which misses short names such as "L&T".
 
 ## Running locally (optional)

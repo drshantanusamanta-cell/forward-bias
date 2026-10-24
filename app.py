@@ -803,6 +803,286 @@ def watch_tab(gsec, fin_mode, tl, eq, fo):
     st.download_button("⬇️ Download ranking (CSV)", (header + res.to_csv(index=False)).encode("utf-8"),
                        "forward_matrix_ranking.csv", "text/csv", width="stretch")
 
+# ── portfolio ─────────────────────────────────────────────────────────────────
+PF_SYM = ["symbol", "tradingsymbol", "trading symbol", "instrument", "ticker", "scrip", "scrip name", "stock", "stock name",
+          "security", "nse symbol", "nse code", "script", "name"]
+PF_QTY = ["qty", "quantity", "shares", "units", "holding qty", "net qty", "available qty", "total qty", "no of shares"]
+PF_COST = ["avg cost", "average cost", "avg price", "average price", "avg buy price", "buy price", "cost price",
+           "purchase price", "avg rate", "buy avg", "avg"]
+
+def _norm_col(c) -> str:
+    import re
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", str(c).lower())).strip()
+
+def _pick(cols, wanted):
+    nc = {c: _norm_col(c) for c in cols}
+    for w in wanted:                                    # exact name first, then "starts with"
+        for c, n in nc.items():
+            if n == w: return c
+    for w in wanted:
+        for c, n in nc.items():
+            if n.startswith(w): return c
+    return None
+
+def _clean_sym(x) -> str:
+    s = str(x).upper().strip()
+    for p in ("NSE:", "BSE:"):
+        if s.startswith(p): s = s[len(p):]
+    for suf in (".NS", "-EQ", "-BE", "-BZ", "-SM", "-ST"):
+        if s.endswith(suf): s = s[: -len(suf)]
+    return s.strip()
+
+def read_portfolio(upload):
+    """Returns (holdings DataFrame [Symbol, Qty, Avg cost], message)."""
+    name = upload.name.lower()
+    raw = pd.read_csv(upload) if name.endswith(".csv") else pd.read_excel(upload)
+    if raw.empty: return None, "The file is empty."
+    # some broker exports have title rows above the header: find the first row that contains a symbol-like header
+    if _pick(raw.columns, PF_SYM) is None:
+        for i in range(min(15, len(raw))):
+            hdr = raw.iloc[i].astype(str).tolist()
+            if _pick(hdr, PF_SYM):
+                raw = raw.iloc[i + 1:].reset_index(drop=True); raw.columns = hdr; break
+    sc, qc, cc = _pick(raw.columns, PF_SYM), _pick(raw.columns, PF_QTY), _pick(raw.columns, PF_COST)
+    if sc is None: return None, "Could not find a symbol column (e.g. Symbol, Instrument, Tradingsymbol)."
+    df = pd.DataFrame({"Symbol": raw[sc].map(_clean_sym),
+                       "Qty": pd.to_numeric(raw[qc].astype(str).str.replace(",", ""), errors="coerce") if qc else np.nan,
+                       "Avg cost": pd.to_numeric(raw[cc].astype(str).str.replace(",", ""), errors="coerce") if cc else np.nan})
+    df = df[df["Symbol"].str.len().between(1, 20) & ~df["Symbol"].isin(["NAN", "TOTAL", "GRAND TOTAL", ""])]
+    df["cost_val"] = df["Qty"] * df["Avg cost"]
+    g = df.groupby("Symbol", sort=False).agg(Qty=("Qty", lambda x: x.sum(min_count=1)), cost_val=("cost_val", lambda x: x.sum(min_count=1)))
+    g["Avg cost"] = g["cost_val"] / g["Qty"]
+    g = g.drop(columns="cost_val").reset_index()
+    msg = f"Read {len(g)} holdings · symbol column “{sc}”" + (f" · quantity “{qc}”" if qc else " · no quantity column (equal weights)") \
+          + (f" · average cost “{cc}”" if cc else " · no cost column (P&L not shown)")
+    return g, msg
+
+def _pf_flags(r, conc=15.0) -> str:
+    f = []
+    if isnum(r.get("Overall %")) and r["Overall %"] <= -15: f.append("Weak outlook")
+    if isnum(r.get("EPS revision 90d %")) and r["EPS revision 90d %"] <= -3: f.append("Estimates cut")
+    if isnum(r.get("Target upside %")) and r["Target upside %"] < 0: f.append("Above analyst target")
+    if isnum(r.get("vs 200-DMA %")) and r["vs 200-DMA %"] < 0: f.append("Below 200-DMA")
+    if isnum(r.get("Weight %")) and r["Weight %"] > conc: f.append(f"Concentration >{conc:.0f}%")
+    if isnum(r.get("Coverage %")) and r["Coverage %"] < 60: f.append("Low data")
+    if r.get("Checks ⚠"): f.append("Source mismatch")
+    return " · ".join(f)
+
+def _wavg(v, w):
+    m = v.notna() & w.notna()
+    return float((v[m] * w[m]).sum() / w[m].sum()) if m.any() and w[m].sum() else None
+
+def portfolio_tab(gsec, fin_mode, tl, eq, fo):
+    st.markdown("Upload your holdings (CSV or Excel). Broker exports from Zerodha, Dhan, Upstox, Groww etc. usually work: "
+                "the app looks for a **symbol**, **quantity** and **average cost** column. Only NSE equities are analysed.")
+    up = st.file_uploader("Portfolio file", type=["csv", "xlsx", "xls"], key="pf_up")
+    with st.expander("Example layout"):
+        st.dataframe(pd.DataFrame({"Symbol": ["TCS", "HDFCBANK", "SHRIRAMFIN"], "Qty": [10, 40, 25], "Avg cost": [3450, 1520, 590]}),
+                     hide_index=True)
+    if up is None:
+        st.info("Upload a file to begin."); return
+    try:
+        hold, msg = read_portfolio(up)
+    except Exception as e:
+        st.error(f"Could not read the file: {e}"); return
+    if hold is None or hold.empty:
+        st.error(msg or "No holdings found."); return
+    st.caption(msg)
+
+    # symbol check against the NSE list, with a best guess for anything that is not an exact symbol
+    try:
+        nse = cached_nse_list(); known = set(nse["SYMBOL"])
+    except Exception:
+        nse, known = None, None
+    status, use = [], []
+    for s_ in hold["Symbol"]:
+        if known is None or s_ in known:
+            status.append("✓ NSE symbol"); use.append(s_)
+        else:
+            g_ = suggest_symbols(s_, nse, 1)
+            status.append(f"⚠ not found → suggested {g_[0][0]}" if g_ else "⚠ not found"); use.append(g_[0][0] if g_ else s_)
+    hold.insert(1, "Analyse as", use); hold["Check"] = status
+    n_bad = sum(1 for x in status if x.startswith("⚠"))
+    if n_bad:
+        st.warning(f"{n_bad} symbol(s) were not exact NSE symbols. A best guess is filled in under **Analyse as** — "
+                   "correct it if wrong, or clear the cell to skip that holding.")
+    hold = st.data_editor(hold, hide_index=True, width="stretch", key="pf_edit",
+                          disabled=["Symbol", "Check"],
+                          column_config={"Analyse as": st.column_config.TextColumn(help="NSE symbol used for the analysis"),
+                                         "Avg cost": st.column_config.NumberColumn(format="%.2f")})
+
+    if st.button("🧮 Analyse portfolio", type="primary"):
+        todo = hold[hold["Analyse as"].astype(str).str.strip() != ""]
+        prog = st.progress(0.0, text="Starting…"); rows = []
+        for i, (_, r) in enumerate(todo.iterrows(), 1):
+            sym = _clean_sym(r["Analyse as"])
+            prog.progress(i / len(todo), text=f"{sym} ({i}/{len(todo)})")
+            base = {"Symbol": sym, "Qty": r["Qty"], "Avg cost": r["Avg cost"]}
+            try:
+                snap, res, matched = scan(E.norm_ticker(sym), gsec, fin_mode, tl, eq, fo)
+                d, p = snap.data, res["pillars"]
+                rows.append({**base, "Name": snap.name, "Sector": snap.sector or "—", "LTP": snap.price,
+                             "Overall %": res["composite"], "Outlook": band(res["composite"])[0], "Coverage %": res["coverage"],
+                             **{f"{PILLAR_ICON[k]} {k}": p[k] for k in E.PILLARS},
+                             "EPS growth %": d.get("fwd_growth"), "PEG": d.get("peg"), "Target upside %": snap.values.get("G1"),
+                             "EPS revision 90d %": d.get("eps_rev90"), "vs 200-DMA %": snap.values.get("M3"),
+                             "Checks ⚠": sum(1 for c in snap.checks if str(c["Status"]).startswith("⚠"))})
+            except Exception as e:
+                rows.append({**base, "Name": f"error: {str(e)[:60]}"})
+            time.sleep(0.15)
+        prog.empty()
+        df = pd.DataFrame(rows)
+        for c in ["Qty", "Avg cost", "LTP"]:
+            df[c] = pd.to_numeric(df.get(c), errors="coerce")
+        qty_known = df["Qty"].notna().any()
+        df["Value ₹"] = df["Qty"] * df["LTP"] if qty_known else np.nan
+        df["Invested ₹"] = df["Qty"] * df["Avg cost"]
+        df["P&L %"] = (df["LTP"] / df["Avg cost"] - 1) * 100
+        w = df["Value ₹"] if qty_known and df["Value ₹"].notna().any() else pd.Series(1.0, index=df.index).where(df["LTP"].notna())
+        df["Weight %"] = w / w.sum() * 100
+        df["Weighted contribution"] = df["Weight %"] * df["Overall %"] / 100
+        conc = max(15.0, 150.0 / max(1, int(df["Weight %"].notna().sum())))   # small portfolios: 1.5× equal weight
+        df["Flags"] = df.apply(lambda r: _pf_flags(r, conc), axis=1)
+        st.session_state["pf_result"] = df
+        st.success(f"Analysed {len(df)} holdings.")
+
+    df = st.session_state.get("pf_result")
+    if df is None or "Overall %" not in df:
+        return
+    pcols = [f"{PILLAR_ICON[k]} {k}" for k in E.PILLARS]
+    ok_ = df.dropna(subset=["Overall %", "Weight %"])
+    w = ok_["Weight %"]
+    pf_score = _wavg(ok_["Overall %"], w)
+    pf_cov = _wavg(ok_["Coverage %"], w)
+    lab, col, _ = band(pf_score)
+    inv, val = df["Invested ₹"].sum(min_count=1), df["Value ₹"].sum(min_count=1)
+    pos_w = ok_.loc[ok_["Overall %"] >= 15, "Weight %"].sum(); neg_w = ok_.loc[ok_["Overall %"] <= -15, "Weight %"].sum()
+
+    st.markdown("### 💼 Portfolio forward view")
+    tiles = [f'<div class="verdict" style="background:{col}"><div class="lab">Portfolio outlook (value-weighted)</div>'
+             f'<div class="val">{pct(pf_score)}</div><div class="note">{lab}</div></div>',
+             kpi("Holdings analysed", f"{len(ok_)} / {len(df)}", f"data coverage {pf_cov:.0f}%" if isnum(pf_cov) else ""),
+             kpi("Weight in positive outlook", f"{pos_w:.0f}%", "score ≥ +15%", "#1e8449"),
+             kpi("Weight in negative outlook", f"{neg_w:.0f}%", "score ≤ −15%", "#c0392b")]
+    if isnum(val): tiles.append(kpi("Current value", f"₹{val:,.0f}", "Qty × last price (Yahoo)"))
+    if isnum(inv) and isnum(val) and inv:
+        tiles.append(kpi("Unrealised P&L", pct((val / inv - 1) * 100, 1), ("−" if val < inv else "+") + f"₹{abs(val - inv):,.0f}",
+                         "#1e8449" if val >= inv else "#c0392b"))
+    st.markdown('<div class="grid">' + "".join(tiles) + "</div>", unsafe_allow_html=True)
+    st.markdown(legend_html(), unsafe_allow_html=True)
+    if neg_w >= 30:
+        st.warning(f"{neg_w:.0f}% of the portfolio sits in stocks with a negative forward outlook — see the flagged rows below.")
+
+    # infographics
+    a, b = st.columns([1.4, 1])
+    with a:
+        st.markdown("**🗺️ Portfolio map** — box size = weight, colour = forward score")
+        tm = ok_.copy(); tm["Sector"] = tm["Sector"].fillna("—")
+        secs = tm["Sector"].unique().tolist()
+        sec_score = {s_: _wavg(g_["Overall %"], g_["Weight %"]) for s_, g_ in tm.groupby("Sector")}
+        ids = ["Portfolio"] + [f"S:{s_}" for s_ in secs] + [f"T:{t_}" for t_ in tm["Symbol"]]
+        labels = ["Portfolio"] + secs + tm["Symbol"].tolist()
+        parents = [""] + ["Portfolio"] * len(secs) + [f"S:{s_}" for s_ in tm["Sector"]]
+        values = [0] + [0] * len(secs) + tm["Weight %"].tolist()
+        colors = [pf_score or 0] + [sec_score[s_] or 0 for s_ in secs] + tm["Overall %"].tolist()
+        texts = [pct(pf_score)] + [pct(sec_score[s_]) for s_ in secs] + [f"{pct(v)} · {wt:.1f}%" for v, wt in zip(tm["Overall %"], tm["Weight %"])]
+        fig = go.Figure(go.Treemap(ids=ids, labels=labels, parents=parents, values=values, branchvalues="remainder",
+                                   marker=dict(colors=colors, cmin=-100, cmax=100, colorscale=[[0, "#c0392b"], [0.3, "#e67e22"],
+                                               [0.5, "#f2f3f4"], [0.7, "#52be80"], [1, "#1e8449"]], showscale=False),
+                                   text=texts, texttemplate="<b>%{label}</b><br>%{text}", textposition="middle center",
+                                   textfont=dict(size=14), hovertemplate="%{label}<br>%{text}<extra></extra>"))
+        fig.update_layout(height=420, margin=dict(l=2, r=2, t=2, b=2))
+        st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
+    with b:
+        st.markdown("**🎯 Portfolio score**")
+        st.plotly_chart(gauge(pf_score), width="stretch", config=PLOT_CFG)
+        bw = ok_.groupby(ok_["Overall %"].map(lambda v: band(v)[0]))["Weight %"].sum()
+        order = [x[1] for x in BANDS]
+        fig = go.Figure(go.Pie(labels=[o for o in order if o in bw], values=[bw[o] for o in order if o in bw], hole=.6, sort=False,
+                               marker_colors=[x[2] for x in BANDS if x[1] in bw], textinfo="percent"))
+        fig.update_layout(height=200, margin=dict(l=0, r=0, t=0, b=0), legend=dict(orientation="h", y=-0.1, font=dict(size=10)))
+        st.markdown("**Share of portfolio value by outlook**")
+        st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
+
+    c, d_ = st.columns([1, 1])
+    with c:
+        st.markdown("**🧭 Portfolio pillars** (value-weighted)")
+        pw = {k: _wavg(ok_[f"{PILLAR_ICON[k]} {k}"], ok_["Weight %"]) for k in E.PILLARS}
+        st.plotly_chart(pillar_bars(pw), width="stretch", config=PLOT_CFG)
+    with d_:
+        st.markdown("**🏭 Sector weight and forward score**")
+        sw = ok_.groupby("Sector")["Weight %"].sum().sort_values()
+        fig = go.Figure(go.Bar(x=sw.values, y=sw.index, orientation="h", marker_color=[band(sec_score.get(s_))[1] for s_ in sw.index],
+                               text=[f"{v:.1f}% · {pct(sec_score.get(s_))}" for s_, v in sw.items()], textposition="outside", cliponaxis=False))
+        fig.update_layout(height=max(240, 30 * len(sw) + 60), margin=dict(l=4, r=4, t=4, b=4),
+                          xaxis=dict(ticksuffix="%", range=[0, float(sw.max()) * 1.45]))
+        st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
+        st.caption("Bar length = share of portfolio · colour = value-weighted forward score of that sector.")
+
+    if ok_["P&L %"].notna().any():
+        st.markdown("**📍 Forward score vs your profit/loss** — bubble size = weight")
+        fig = go.Figure(go.Scatter(x=ok_["Overall %"], y=ok_["P&L %"], mode="markers+text", text=ok_["Symbol"], textposition="top center",
+                                   marker=dict(size=(ok_["Weight %"].clip(lower=1) ** 0.5) * 9, color=[band(v)[1] for v in ok_["Overall %"]],
+                                               line=dict(color="white", width=1), opacity=.85),
+                                   hovertemplate="%{text}<br>Score %{x:+.0f}%<br>P&L %{y:+.1f}%<extra></extra>"))
+        fig.update_traces(cliponaxis=False)
+        fig.add_vline(x=0, line_color="#888"); fig.add_hline(y=0, line_color="#888")
+        fig.update_layout(height=380, margin=dict(l=4, r=4, t=8, b=4), xaxis=dict(title="Forward score", ticksuffix="%", range=[-110, 110]),
+                          yaxis=dict(title="Unrealised P&L", ticksuffix="%",
+                                     range=[min(0, ok_["P&L %"].min()) - 15, max(0, ok_["P&L %"].max()) + 20]))
+        st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
+        st.caption("Top-right: in profit with an improving outlook · bottom-left: in loss with a weakening outlook · "
+                   "top-left / bottom-right: price and outlook disagree — worth a closer look.")
+
+    # table
+    show = ["Symbol", "Name", "Sector", "Weight %", "Overall %", "Outlook", "Flags", "Qty", "Avg cost", "LTP", "Invested ₹",
+            "Value ₹", "P&L %", "Weighted contribution", "Coverage %"] + pcols + ["EPS growth %", "PEG", "Target upside %",
+            "EPS revision 90d %", "vs 200-DMA %"]
+    out = df[[c_ for c_ in show if c_ in df]].sort_values("Weight %", ascending=False, na_position="last").reset_index(drop=True)
+    st.markdown("### 📋 Holding by holding")
+    sig = [c_ for c_ in ["Overall %"] + pcols if c_ in out]
+    sgn = [c_ for c_ in ["P&L %", "EPS growth %", "Target upside %", "EPS revision 90d %", "vs 200-DMA %", "Weighted contribution"] if c_ in out]
+    fmt = {c_: pct for c_ in sig}
+    fmt.update({c_: (lambda v: pct(v, 1)) for c_ in sgn})
+    fmt.update({"Weight %": lambda v: "–" if not isnum(v) else f"{v:.1f}%", "Coverage %": lambda v: "–" if not isnum(v) else f"{v:.0f}%",
+                "Qty": lambda v: "–" if not isnum(v) else f"{v:,.0f}", "PEG": "{:.2f}",
+                "Avg cost": "₹{:,.2f}", "LTP": "₹{:,.2f}", "Invested ₹": "₹{:,.0f}", "Value ₹": "₹{:,.0f}"})
+    def _sty(frame):
+        return (frame.style
+                .map(lambda v: (f"background-color:{band(v)[2]};color:{band(v)[1]};font-weight:700" if isnum(v) else ""), subset=sig)
+                .map(lambda v: (f"color:{'#1e8449' if v > 0 else '#c0392b' if v < 0 else '#5f6b72'}" if isnum(v) else ""), subset=sgn)
+                .map(lambda v: ("color:#c0392b;font-weight:600" if isinstance(v, str) and v else ""), subset=["Flags"]))
+    st.dataframe(_sty(out).format(fmt, na_rep="–"), hide_index=True, width="stretch", height=min(36 * len(out) + 40, 900))
+    st.caption("Flags are mechanical alerts, not advice: Weak outlook (≤ −15%), Estimates cut (90-day EPS revision ≤ −3%), "
+               "Above analyst target, Below 200-DMA, Concentration (> 15% of value, or 1.5× an equal weight in small portfolios), Low data (< 60% coverage), Source mismatch.")
+
+    # downloads
+    stamp = dt.date.today().isoformat()
+    header = (f"# Forward Matrix Scanner - portfolio forward view - {stamp} - Portfolio score {pct(pf_score)} ({lab})\n"
+              f"# Created by {AUTHOR}. (c) 2026 {AUTHOR}. {DISCLAIMER_SHORT}\n")
+    x1, x2 = st.columns(2)
+    x1.download_button("⬇️ Download analysis (CSV)", (header + out.to_csv(index=False)).encode("utf-8"),
+                       f"portfolio_forward_view_{stamp}.csv", "text/csv", width="stretch")
+    try:
+        import io
+        buf = io.BytesIO()
+        summ = pd.DataFrame({"Item": ["Portfolio forward score (value-weighted)", "Outlook", "Holdings analysed", "Data coverage",
+                                      "Weight in positive outlook", "Weight in negative outlook", "Current value ₹", "Invested ₹",
+                                      "Date", "Created by", "Disclaimer"],
+                             "Value": [pct(pf_score), lab, f"{len(ok_)} / {len(df)}", f"{pf_cov:.0f}%" if isnum(pf_cov) else "–",
+                                       f"{pos_w:.0f}%", f"{neg_w:.0f}%", f"{val:,.0f}" if isnum(val) else "–",
+                                       f"{inv:,.0f}" if isnum(inv) else "–", stamp, f"{AUTHOR} · {AUTHOR_LINE}", DISCLAIMER_SHORT]})
+        with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+            summ.to_excel(xw, sheet_name="Summary", index=False)
+            _sty(out.round(2)).to_excel(xw, sheet_name="Holdings", index=False)
+            for ws in xw.book.worksheets:
+                for col_cells in ws.columns:
+                    ws.column_dimensions[col_cells[0].column_letter].width = min(48, max(10, max(len(str(c_.value or "")) for c_ in col_cells) + 2))
+        x2.download_button("⬇️ Download colour-coded Excel", buf.getvalue(), f"portfolio_forward_view_{stamp}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+    except Exception as e:
+        x2.caption(f"Excel export unavailable: {e}")
+
 # ── method, legal, about ──────────────────────────────────────────────────────
 def method_tab():
     st.markdown("### 🧭 How the score is built — 4 steps")
@@ -890,9 +1170,10 @@ def main():
     if not disclaimer_gate():
         footer(); return
     eq, fo = nse_data(eq_files, fo_files)
-    t1, t2, t3, t4 = st.tabs(["🔍 Single company", "📋 Watchlist", "🧭 Method & legal", "👨‍⚕️ About"])
+    t1, t2, t5, t3, t4 = st.tabs(["🔍 Single company", "📋 Watchlist", "💼 Portfolio", "🧭 Method & legal", "👨‍⚕️ About"])
     with t1: single_tab(gsec, fin_mode, tl, eq, fo, use_news)
     with t2: watch_tab(gsec, fin_mode, tl, eq, fo)
+    with t5: portfolio_tab(gsec, fin_mode, tl, eq, fo)
     with t3: method_tab()
     with t4: about_tab()
     footer()

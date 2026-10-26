@@ -1083,6 +1083,260 @@ def portfolio_tab(gsec, fin_mode, tl, eq, fo):
     except Exception as e:
         x2.caption(f"Excel export unavailable: {e}")
 
+# ── NIFTY 500 sector view (in-app scan) ───────────────────────────────────────
+SEC_FILE = "nifty500_constituents.csv"     # NSE Indices list (Company Name, Industry, Symbol, Series, ISIN Code); replace after each rebalance
+SEC_THIN = 6                               # sectors with fewer scanned stocks are shown as "thin"
+
+def _load_constituents(upload=None):
+    import os
+    src = upload if upload is not None else os.path.join(os.path.dirname(os.path.abspath(__file__)), SEC_FILE)
+    d = pd.read_csv(src)
+    d.columns = [c.strip() for c in d.columns]
+    return pd.DataFrame({"Symbol": d["Symbol"].astype(str).str.strip().str.upper(),
+                         "Company": d["Company Name"].astype(str).str.strip(),
+                         "Sector": d["Industry"].astype(str).str.strip()}).drop_duplicates("Symbol").reset_index(drop=True)
+
+def _sector_table(stocks: pd.DataFrame) -> pd.DataFrame:
+    pcols = [f"{PILLAR_ICON[k]} {k}" for k in E.PILLARS]
+    out = []
+    for sec, g in stocks.groupby("Sector"):
+        v = g.dropna(subset=["Overall %"])
+        mc = pd.to_numeric(v["Mcap ₹ cr"], errors="coerce")
+        row = {"Sector": sec, "Stocks scanned": len(v),
+               "Score (mcap-weighted) %": _wavg(v["Overall %"], mc) if mc.notna().any() else None,
+               "Score (equal-weight) %": float(v["Overall %"].mean()) if len(v) else None,
+               "Median %": float(v["Overall %"].median()) if len(v) else None,
+               "Positive %": float((v["Overall %"] >= 15).mean() * 100) if len(v) else None,
+               "Negative %": float((v["Overall %"] <= -15).mean() * 100) if len(v) else None,
+               "Coverage %": float(v["Coverage %"].mean()) if len(v) else None,
+               "Mcap ₹ cr": float(mc.sum()) if mc.notna().any() else None}
+        for c in pcols:
+            row[c] = _wavg(pd.to_numeric(v[c], errors="coerce"), mc) if c in v and mc.notna().any() else None
+        row["Note"] = "thin sector" if len(v) < SEC_THIN else ""
+        out.append(row)
+    t = pd.DataFrame(out)
+    if len(t):
+        t.insert(t.columns.get_loc("Mcap ₹ cr") + 1, "Weight in scan %", t["Mcap ₹ cr"] / t["Mcap ₹ cr"].sum() * 100)
+        t = t.sort_values("Score (mcap-weighted) %", ascending=False, na_position="last").reset_index(drop=True)
+    return t
+
+def sector_tab(gsec, fin_mode, tl, eq, fo):
+    st.markdown("Scan every **NIFTY 500** stock, group them by NSE sector and see the **forward view sector by sector**. "
+                "A full scan takes roughly **30–60 minutes**; keep this tab open while it runs.")
+    with st.expander("⚙️ Scan settings & rate-limit protection", expanded=False):
+        up_list = st.file_uploader("Replace the NIFTY 500 list (optional)", type=["csv"], key="sec_list",
+            help="The bundled list is NSE Indices' ind_nifty500list.csv. Replace it after each half-yearly rebalance.")
+        c1, c2, c3 = st.columns(3)
+        pause = c1.slider("Pause between stocks (s)", 0.5, 5.0, 1.5, 0.5,
+                          help="Longer pauses = slower scan but less chance of Yahoo blocking requests.")
+        batch = c2.slider("Rest after every N stocks", 25, 150, 50, 25)
+        rest = c3.slider("Rest length (s)", 10, 120, 30, 10)
+        use_dhan = st.checkbox("Include Dhan data (if connected)", value=False,
+            help="Adds one Dhan call per stock (500 per scan). Leave off unless you need V8 / FII-DII for every stock.")
+    try:
+        cons = _load_constituents(up_list)
+    except Exception as e:
+        st.error(f"Could not read the NIFTY 500 list: {e}"); return
+    sectors = sorted(cons["Sector"].unique())
+    pick = st.multiselect("Sectors to scan (leave empty for all)", sectors, key="sec_pick")
+    todo_all = cons[cons["Sector"].isin(pick)] if pick else cons
+    done = st.session_state.setdefault("sec_rows", {})
+    failed = st.session_state.setdefault("sec_failed", {})
+    pending = [s_ for s_ in todo_all["Symbol"] if s_ not in done]
+    st.caption(f"{len(todo_all)} stocks selected · {len(todo_all) - len(pending)} already scanned this session · {len(pending)} to go. "
+               "Yahoo data is cached for 6 hours, so a resumed or repeated scan skips stocks already fetched.")
+
+    b1, b2, b3 = st.columns(3)
+    start = b1.button("🏭 Start / resume NIFTY 500 scan" if pending else "✅ Scan complete", type="primary",
+                      width="stretch", disabled=not pending)
+    retry = b2.button(f"🔁 Retry failed ({len(failed)})", width="stretch", disabled=not failed)
+    if b3.button("🗑️ Clear scan results", width="stretch"):
+        st.session_state["sec_rows"], st.session_state["sec_failed"] = {}, {}
+        st.rerun()
+
+    def _run(symbols, slow=1.0):
+        info = cons.set_index("Symbol")
+        saved_dhan = None if use_dhan else st.session_state.pop("dhan_cfg", None)   # skip Dhan unless asked
+        prog = st.progress(0.0, text="Starting…"); t0 = time.time(); streak = 0
+        try:
+            for i, sym in enumerate(symbols, 1):
+                el = time.time() - t0
+                eta = el / (i - 1) * (len(symbols) - i + 1) if i > 1 else 0
+                prog.progress(i / len(symbols), text=f"{sym} ({i}/{len(symbols)}) · elapsed {el/60:.0f} min · ~{eta/60:.0f} min left")
+                try:
+                    snap, res, _ = scan(E.norm_ticker(sym), gsec, fin_mode, tl, eq, fo)
+                    if snap.price is None:
+                        raise ValueError("no price data")
+                    d, p = snap.data, res["pillars"]
+                    done[sym] = {"Symbol": sym, "Company": info.loc[sym, "Company"], "Sector": info.loc[sym, "Sector"],
+                                 "Mcap ₹ cr": (d.get("mcap") or np.nan) / 1e7, "Overall %": res["composite"],
+                                 "Outlook": band(res["composite"])[0], "Coverage %": res["coverage"],
+                                 **{f"{PILLAR_ICON[k]} {k}": p[k] for k in E.PILLARS},
+                                 "EPS growth %": d.get("fwd_growth"), "EPS revision 90d %": d.get("eps_rev90"),
+                                 "Target upside %": snap.values.get("G1"), "vs 200-DMA %": snap.values.get("M3")}
+                    failed.pop(sym, None); streak = 0
+                except Exception as e:
+                    failed[sym] = str(e)[:80]; streak += 1
+                    if streak >= 5:                      # 5 failures in a row usually means Yahoo is throttling: back off
+                        prog.progress(i / len(symbols), text=f"Several failures in a row — backing off for {rest * 2}s…")
+                        time.sleep(rest * 2); streak = 0
+                time.sleep(pause * slow * (0.8 + 0.4 * np.random.rand()))   # jittered pause
+                if i % batch == 0 and i < len(symbols):
+                    prog.progress(i / len(symbols), text=f"Resting {rest}s after {i} stocks (rate-limit protection)…")
+                    time.sleep(rest)
+        finally:
+            if saved_dhan: st.session_state["dhan_cfg"] = saved_dhan
+            prog.empty()
+
+    if start and pending:
+        _run(pending)
+        st.success(f"Scan finished · {len(done)} stocks scored · {len(failed)} failed.")
+    if retry and failed:
+        time.sleep(5); _run(list(failed), slow=2.0)
+
+    if failed:
+        with st.expander(f"⚠️ {len(failed)} stocks could not be scored"):
+            st.dataframe(pd.DataFrame([{"Symbol": k, "Reason": v} for k, v in failed.items()]), hide_index=True, width="stretch")
+    if not done:
+        st.info("No results yet. Press **Start** — you can interrupt at any time and resume later in this session; "
+                "any other click in the app pauses the scan.")
+        return
+
+    stocks = pd.DataFrame(list(done.values()))
+    stocks = stocks[stocks["Symbol"].isin(todo_all["Symbol"])] if pick else stocks
+    sec = _sector_table(stocks)
+    pcols = [f"{PILLAR_ICON[k]} {k}" for k in E.PILLARS]
+
+    # optional comparison with an earlier scan (stock-level CSV downloaded from this tab)
+    prev_up = st.file_uploader("Compare with a previous scan (stock-level CSV from this tab, optional)", type=["csv"], key="sec_prev")
+    if prev_up is not None:
+        try:
+            prev = pd.read_csv(prev_up, comment="#")
+            pt = _sector_table(prev).set_index("Sector")["Score (mcap-weighted) %"]
+            sec.insert(2, "Change vs previous (pts)", sec["Sector"].map(pt).pipe(lambda x: sec["Score (mcap-weighted) %"] - x))
+        except Exception as e:
+            st.warning(f"Could not read the previous scan: {e}")
+
+    # headline
+    total = _wavg(stocks["Overall %"], pd.to_numeric(stocks["Mcap ₹ cr"], errors="coerce"))
+    lab, col, _ = band(total)
+    solid = sec[sec["Note"] == ""]
+    best = solid.iloc[0] if len(solid) else None
+    worst = solid.iloc[-1] if len(solid) else None
+    tiles = [f'<div class="verdict" style="background:{col}"><div class="lab">NIFTY 500 scan (mcap-weighted)</div>'
+             f'<div class="val">{pct(total)}</div><div class="note">{lab}</div></div>',
+             kpi("Stocks scored", f"{len(stocks)} / {len(todo_all)}", f"{len(failed)} failed"),
+             kpi("Breadth", f"{(stocks['Overall %'] >= 15).mean() * 100:.0f}% positive",
+                 f"{(stocks['Overall %'] <= -15).mean() * 100:.0f}% negative")]
+    if best is not None:
+        tiles.append(kpi("Strongest sector", f'<span style="font-size:1.05rem">{esc(best["Sector"])}</span>',
+                         pct(best["Score (mcap-weighted) %"]), band(best["Score (mcap-weighted) %"])[1]))
+        tiles.append(kpi("Weakest sector", f'<span style="font-size:1.05rem">{esc(worst["Sector"])}</span>',
+                         pct(worst["Score (mcap-weighted) %"]), band(worst["Score (mcap-weighted) %"])[1]))
+    st.markdown("### 🏭 Sector forward view")
+    st.markdown('<div class="grid">' + "".join(tiles) + "</div>", unsafe_allow_html=True)
+    st.markdown(legend_html(), unsafe_allow_html=True)
+
+    a, b = st.columns([1, 1.3])
+    with a:
+        st.markdown("**🏆 Sector ranking** (mcap-weighted score)")
+        s_ = sec.dropna(subset=["Score (mcap-weighted) %"])
+        fig = go.Figure(go.Bar(x=s_["Score (mcap-weighted) %"], y=s_["Sector"], orientation="h",
+                               marker_color=[band(v)[1] if n == "" else "#d5d8dc" for v, n in zip(s_["Score (mcap-weighted) %"], s_["Note"])],
+                               text=[f"{pct(v)} · n={int(k)}" for v, k in zip(s_["Score (mcap-weighted) %"], s_["Stocks scanned"])],
+                               textposition="outside", cliponaxis=False))
+        fig.update_layout(height=max(320, 28 * len(s_) + 60), margin=dict(l=4, r=40, t=4, b=4),
+                          yaxis=dict(autorange="reversed"), xaxis=dict(range=[-110, 110], ticksuffix="%"))
+        st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
+        st.caption("Grey bars = thin sectors (fewer than 6 stocks scored) — treat with caution.")
+    with b:
+        st.markdown("**📊 Breadth** — share of stocks positive / neutral / negative")
+        s_ = sec.copy(); s_["Neutral %"] = 100 - s_["Positive %"] - s_["Negative %"]
+        fig = go.Figure()
+        for c_, colr in [("Positive %", "#52be80"), ("Neutral %", "#d5d8dc"), ("Negative %", "#e67e22")]:
+            fig.add_trace(go.Bar(y=s_["Sector"], x=s_[c_], name=c_.replace(" %", ""), orientation="h", marker_color=colr,
+                                 text=[f"{v:.0f}%" if v >= 8 else "" for v in s_[c_]], textposition="inside"))
+        fig.update_layout(barmode="stack", height=max(320, 28 * len(s_) + 60), margin=dict(l=4, r=4, t=30, b=4),
+                          yaxis=dict(autorange="reversed"), xaxis=dict(range=[0, 100], ticksuffix="%"),
+                          legend=dict(orientation="h", y=1.08))
+        st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
+
+    st.markdown("**🧩 Sector × pillar heat-map** (mcap-weighted)")
+    z = sec[pcols].apply(pd.to_numeric, errors="coerce").values
+    hm = go.Figure(go.Heatmap(z=z, x=[c_.split(" ", 1)[1].replace(" & ", " &<br>") for c_ in pcols], y=sec["Sector"], zmin=-100, zmax=100,
+                              colorscale=[[0, "#c0392b"], [0.3, "#e67e22"], [0.5, "#f2f3f4"], [0.7, "#52be80"], [1, "#1e8449"]],
+                              text=[[pct(v) for v in r_] for r_ in z], texttemplate="%{text}", hoverongaps=False,
+                              colorbar=dict(ticksuffix="%", thickness=10)))
+    hm.update_layout(height=max(340, 28 * len(sec) + 90), margin=dict(l=4, r=4, t=8, b=4), yaxis=dict(autorange="reversed"))
+    st.plotly_chart(hm, width="stretch", config=PLOT_CFG)
+
+    if "Change vs previous (pts)" in sec:
+        st.markdown("**🔄 Sector rotation** — current score vs change since the previous scan (bubble = market cap)")
+        r_ = sec.dropna(subset=["Score (mcap-weighted) %", "Change vs previous (pts)"])
+        fig = go.Figure(go.Scatter(x=r_["Score (mcap-weighted) %"], y=r_["Change vs previous (pts)"], mode="markers+text",
+                                   text=r_["Sector"], textposition="top center", cliponaxis=False,
+                                   marker=dict(size=(r_["Weight in scan %"].clip(lower=1) ** 0.5) * 8,
+                                               color=[band(v)[1] for v in r_["Score (mcap-weighted) %"]], opacity=.85,
+                                               line=dict(color="white", width=1))))
+        fig.add_vline(x=0, line_color="#888"); fig.add_hline(y=0, line_color="#888")
+        fig.update_layout(height=420, margin=dict(l=4, r=4, t=8, b=4), xaxis=dict(title="Forward score", ticksuffix="%"),
+                          yaxis=dict(title="Change (points)", tickformat="+.1f"))
+        st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
+        st.caption("Top-right: strong and improving · bottom-right: strong but fading · top-left: weak but improving · bottom-left: weak and fading.")
+
+    # sector table
+    st.markdown("### 📋 Sector table")
+    sig = [c_ for c_ in ["Score (mcap-weighted) %", "Score (equal-weight) %", "Median %"] + pcols if c_ in sec]
+    fmt = {c_: pct for c_ in sig}
+    fmt.update({"Positive %": "{:.0f}%", "Negative %": "{:.0f}%", "Coverage %": "{:.0f}%", "Weight in scan %": "{:.1f}%",
+                "Mcap ₹ cr": "₹{:,.0f}", "Change vs previous (pts)": lambda v: "–" if not isnum(v) else f"{v:+.1f}"})
+    def _ssty(frame):
+        return frame.style.map(lambda v: (f"background-color:{band(v)[2]};color:{band(v)[1]};font-weight:700" if isnum(v) else ""),
+                               subset=[c_ for c_ in sig if c_ in frame])
+    st.dataframe(_ssty(sec).format(fmt, na_rep="–"), hide_index=True, width="stretch", height=min(36 * len(sec) + 40, 900))
+    st.caption("Mcap-weighted = how the index sees the sector (Yahoo total market cap, not NSE free-float, so close but not identical). "
+               "Equal-weight = the typical stock. Breadth = % of stocks scoring ≥ +15% (positive) or ≤ −15% (negative).")
+
+    # drill-down
+    st.markdown("### 🔎 Inside a sector")
+    one = st.selectbox("Sector", sec["Sector"].tolist(), key="sec_one")
+    g = stocks[stocks["Sector"] == one].sort_values("Overall %", ascending=False)
+    gcols = ["Symbol", "Company", "Overall %", "Outlook", "Coverage %", "Mcap ₹ cr"] + pcols + \
+            ["EPS growth %", "EPS revision 90d %", "Target upside %", "vs 200-DMA %"]
+    gfmt = {c_: pct for c_ in ["Overall %"] + pcols}
+    gfmt.update({c_: (lambda v: pct(v, 1)) for c_ in ["EPS growth %", "EPS revision 90d %", "Target upside %", "vs 200-DMA %"]})
+    gfmt.update({"Coverage %": "{:.0f}%", "Mcap ₹ cr": "₹{:,.0f}"})
+    st.dataframe(g[gcols].style.map(lambda v: (f"background-color:{band(v)[2]};color:{band(v)[1]};font-weight:700" if isnum(v) else ""),
+                                    subset=["Overall %"] + pcols).format(gfmt, na_rep="–"),
+                 hide_index=True, width="stretch", height=min(36 * len(g) + 40, 700))
+
+    # downloads
+    stamp = dt.date.today().isoformat()
+    header = (f"# Forward Matrix Scanner - NIFTY 500 sector forward view - {stamp} - {len(stocks)} stocks\n"
+              f"# Created by {AUTHOR}. (c) 2026 {AUTHOR}. {DISCLAIMER_SHORT}\n")
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("⬇️ Stock-level CSV (keep for next comparison)", (header + stocks.to_csv(index=False)).encode("utf-8"),
+                       f"nifty500_stocks_{stamp}.csv", "text/csv", width="stretch")
+    d2.download_button("⬇️ Sector CSV", (header + sec.to_csv(index=False)).encode("utf-8"),
+                       f"nifty500_sectors_{stamp}.csv", "text/csv", width="stretch")
+    try:
+        import io
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+            pd.DataFrame({"Item": ["Report", "Date", "Stocks scored", "Created by", "Disclaimer"],
+                          "Value": ["NIFTY 500 sector forward view", stamp, f"{len(stocks)} / {len(todo_all)}",
+                                    f"{AUTHOR} · {AUTHOR_LINE}", DISCLAIMER_SHORT]}).to_excel(xw, sheet_name="About", index=False)
+            _ssty(sec.round(2)).to_excel(xw, sheet_name="Sectors", index=False)
+            stocks.round(2).style.map(lambda v: (f"background-color:{band(v)[2]};color:{band(v)[1]};font-weight:700" if isnum(v) else ""),
+                                      subset=["Overall %"] + pcols).to_excel(xw, sheet_name="Stocks", index=False)
+            for ws in xw.book.worksheets:
+                for col_cells in ws.columns:
+                    ws.column_dimensions[col_cells[0].column_letter].width = min(42, max(10, max(len(str(c_.value or "")) for c_ in col_cells) + 2))
+        d3.download_button("⬇️ Colour-coded Excel", buf.getvalue(), f"nifty500_sector_view_{stamp}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+    except Exception as e:
+        d3.caption(f"Excel export unavailable: {e}")
+
 # ── method, legal, about ──────────────────────────────────────────────────────
 def method_tab():
     st.markdown("### 🧭 How the score is built — 4 steps")
@@ -1170,10 +1424,11 @@ def main():
     if not disclaimer_gate():
         footer(); return
     eq, fo = nse_data(eq_files, fo_files)
-    t1, t2, t5, t3, t4 = st.tabs(["🔍 Single company", "📋 Watchlist", "💼 Portfolio", "🧭 Method & legal", "👨‍⚕️ About"])
+    t1, t2, t5, t6, t3, t4 = st.tabs(["🔍 Single company", "📋 Watchlist", "💼 Portfolio", "🏭 Sectors", "🧭 Method & legal", "👨‍⚕️ About"])
     with t1: single_tab(gsec, fin_mode, tl, eq, fo, use_news)
     with t2: watch_tab(gsec, fin_mode, tl, eq, fo)
     with t5: portfolio_tab(gsec, fin_mode, tl, eq, fo)
+    with t6: sector_tab(gsec, fin_mode, tl, eq, fo)
     with t3: method_tab()
     with t4: about_tab()
     footer()

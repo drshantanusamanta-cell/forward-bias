@@ -235,8 +235,8 @@ def build(raw: dict, idx: pd.DataFrame | None, gsec: float, fin_override: str = 
         fwd_eps = nz(float(est.loc["0y", "avg"])) if "avg" in est.columns else None
         year_ago_eps = nz(float(est.loc["0y", "yearAgoEps"])) if "yearAgoEps" in est.columns else None
         n_an = nz(float(est.loc["0y", "numberOfAnalysts"])) if "numberOfAnalysts" in est.columns else None
-    if trend is not None and len(trend) and "0y" in trend.index:
-        s.eps_trend = trend
+    if trend is not None and len(trend) and "0y" in trend.index and {"current", "90daysAgo"} <= set(trend.columns):
+        s.eps_trend = trend          # stocks with no analyst coverage return an empty-column table: skip G4 instead of crashing
         cur, old = trend.loc["0y", "current"], trend.loc["0y", "90daysAgo"]
         if ok(cur) and ok(old) and old not in (0, 0.0) and cur not in (0, 0.0):
             rev90 = (cur / old - 1) * 100
@@ -472,7 +472,7 @@ def build(raw: dict, idx: pd.DataFrame | None, gsec: float, fin_override: str = 
         chk("Market cap (₹ cr)", mcap / 1e7 if ok(mcap) else None, dhan.get("mcap_cr"), "Yahoo", "Dhan", 5)
         chk("ROE", roe, dhan.get("roe"), "Yahoo", "Dhan", 3, unit="pp")
     if tl_row:
-        y_feps = nz(float(est.loc["0y","avg"])) if est is not None and len(est) and "0y" in est.index else None
+        y_feps = nz(float(est.loc["0y","avg"])) if est is not None and len(est) and "0y" in est.index and "avg" in est.columns else None
         chk("Forward EPS (current FY)", y_feps, tl_row.get("feps"), "Yahoo", "Trendlyne", 10)
         chk("TTM EPS", nz(info.get("trailingEps")), tl_row.get("eps_ttm"), "Yahoo", "Trendlyne", 10)
         y_up = (tgt / s.price - 1) * 100 if ok(tgt) and ok(s.price) else None

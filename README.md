@@ -13,7 +13,7 @@ A Streamlit app that scores any NSE stock on Dr Shantanu Samanta's **Forward Sen
 ### Step 1: Put the code on GitHub
 1. On github.com click **New** (green button), name the repository `forward-matrix-app`, choose **Private** or Public, click **Create repository**.
 2. Click **uploading an existing file**.
-3. Drag in **all** files from this folder: `app.py`, `engine.py`, `nse.py`, `news.py`, `dhan.py`, `requirements.txt`, `README.md`, `.gitignore` and the `.streamlit` folder (with `config.toml` inside). Click **Commit changes**.
+3. Drag in **all** files from this folder: `app.py`, `engine.py`, `nse.py`, `news.py`, `dhan.py`, `nifty500_constituents.csv`, `requirements.txt`, `README.md`, `.gitignore` and the `.streamlit` folder (with `config.toml` inside). Click **Commit changes**.
    *Tip:* if the `.streamlit` folder doesn't upload by drag-and-drop, click **Add file → Create new file**, type `.streamlit/config.toml` as the name and paste its contents.
 
 ### Step 2: Deploy on Streamlit Community Cloud
@@ -48,6 +48,8 @@ On your first visit, read the disclaimer and tick *I have read, understood and a
 3. **Watchlist ranking:** paste up to 300 symbols, or upload a CSV with symbols in the first column, and press **Scan watchlist**. You get counts per colour band, a ranking bar chart, a pillar heat-map and a colour-coded table. Download the ranked table as CSV.
 
 4. **Portfolio:** upload your holdings as CSV or Excel (broker exports usually work; the app looks for a symbol, quantity and average-cost column and skips title rows). Fix any symbol the app flags under *Analyse as*, then press **🧮 Analyse portfolio**. You get a value-weighted portfolio score, a portfolio map, outlook and sector breakdowns, value-weighted pillars, a score-vs-P&L chart, a colour-coded holding table with mechanical flags, and CSV / colour-coded Excel downloads.
+
+5. **Sectors:** press **🏭 Start / resume NIFTY 500 scan** (or pick a few sectors first). A full scan takes 30–60 minutes; any other click pauses it and **Start / resume** continues where it stopped. You get sector scores (market-cap-weighted and equal-weight), breadth, a sector × pillar heat-map, a drill-down per sector and CSV / Excel downloads. Keep the *stock-level CSV* and upload it next time to see each sector's change and a sector-rotation chart. Replace `nifty500_constituents.csv` (NSE Indices' `ind_nifty500list.csv`) after each half-yearly rebalance.
 
 **Trendlyne file tip:** include the **NSE code** column in your Trendlyne view. Without it the app matches by company name, which misses short names such as "L&T".
 

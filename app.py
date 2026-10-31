@@ -1136,72 +1136,120 @@ def sector_tab(gsec, fin_mode, tl, eq, fo):
     try:
         cons = _load_constituents(up_list)
     except Exception as e:
-        st.error(f"Could not read the NIFTY 500 list: {e}"); return
+        if up_list is None:
+            st.error(f"Could not read the NIFTY 500 list: {e}"); return
+        st.warning("That file is not an NSE Indices constituent list (needs Company Name, Industry, Symbol columns) — "
+                   "using the bundled NIFTY 500 list instead. To resume a scan, use **📂 Resume from a downloaded stock-level CSV**.")
+        cons = _load_constituents(None)
     sectors = sorted(cons["Sector"].unique())
     pick = st.multiselect("Sectors to scan (leave empty for all)", sectors, key="sec_pick")
     todo_all = cons[cons["Sector"].isin(pick)] if pick else cons
     done = st.session_state.setdefault("sec_rows", {})
     failed = st.session_state.setdefault("sec_failed", {})
-    pending = [s_ for s_ in todo_all["Symbol"] if s_ not in done]
-    st.caption(f"{len(todo_all)} stocks selected · {len(todo_all) - len(pending)} already scanned this session · {len(pending)} to go. "
+    info = cons.set_index("Symbol")
+
+    # resume from a stock-level CSV downloaded earlier (survives a lost session / page refresh)
+    with st.expander("📂 Resume from a downloaded stock-level CSV or Excel file"):
+        up_res = st.file_uploader("Stock-level CSV or the Excel file from this tab", type=["csv", "xlsx"], key="sec_resume",
+            help="If the page was refreshed or the connection dropped, upload the last stock-level CSV: those stocks are "
+                 "loaded as already scanned and the scan continues with the rest.")
+        if up_res is not None and st.session_state.get("sec_resume_id") != (up_res.name, up_res.size):
+            try:
+                prev_ = (pd.read_excel(up_res, sheet_name="Stocks") if up_res.name.lower().endswith(".xlsx")
+                         else pd.read_csv(up_res, comment="#"))
+                n_ = 0
+                for r_ in prev_.to_dict("records"):
+                    sym_ = str(r_.get("Symbol", "")).strip().upper()
+                    if sym_ in info.index and isnum(r_.get("Overall %")):
+                        done[sym_] = r_; failed.pop(sym_, None); n_ += 1
+                st.session_state["sec_resume_id"] = (up_res.name, up_res.size)
+                st.success(f"Loaded {n_} previously scanned stocks.")
+            except Exception as e:
+                st.error(f"Could not read that file: {e}")
+
+    pending = [s_ for s_ in todo_all["Symbol"] if s_ not in done and s_ not in failed]
+    active = st.session_state.get("sec_active", False) and bool(pending)
+    st.caption(f"{len(todo_all)} stocks selected · {sum(1 for s_ in todo_all['Symbol'] if s_ in done)} scored · "
+               f"{sum(1 for s_ in todo_all['Symbol'] if s_ in failed)} failed · {len(pending)} to go. "
                "Yahoo data is cached for 6 hours, so a resumed or repeated scan skips stocks already fetched.")
 
-    b1, b2, b3 = st.columns(3)
-    start = b1.button("🏭 Start / resume NIFTY 500 scan" if pending else "✅ Scan complete", type="primary",
-                      width="stretch", disabled=not pending)
-    retry = b2.button(f"🔁 Retry failed ({len(failed)})", width="stretch", disabled=not failed)
-    if b3.button("🗑️ Clear scan results", width="stretch"):
-        st.session_state["sec_rows"], st.session_state["sec_failed"] = {}, {}
+    b1, b2, b3, b4 = st.columns(4)
+    start = b1.button("🏭 Start / resume scan" if pending else "✅ Scan complete", type="primary",
+                      width="stretch", disabled=(not pending) or active)
+    pause_btn = b2.button("⏸️ Pause", width="stretch", disabled=not active)
+    retry = b3.button(f"🔁 Retry failed ({len(failed)})", width="stretch", disabled=(not failed) or active)
+    if b4.button("🗑️ Clear scan results", width="stretch"):
+        for k_ in ("sec_rows", "sec_failed"): st.session_state[k_] = {}
+        for k_ in ("sec_active", "sec_t0", "sec_n", "sec_streak", "sec_slow", "sec_resume_id"): st.session_state.pop(k_, None)
         st.rerun()
-
-    def _run(symbols, slow=1.0):
-        info = cons.set_index("Symbol")
-        saved_dhan = None if use_dhan else st.session_state.pop("dhan_cfg", None)   # skip Dhan unless asked
-        prog = st.progress(0.0, text="Starting…"); t0 = time.time(); streak = 0
-        try:
-            for i, sym in enumerate(symbols, 1):
-                el = time.time() - t0
-                eta = el / (i - 1) * (len(symbols) - i + 1) if i > 1 else 0
-                prog.progress(i / len(symbols), text=f"{sym} ({i}/{len(symbols)}) · elapsed {el/60:.0f} min · ~{eta/60:.0f} min left")
-                try:
-                    snap, res, _ = scan(E.norm_ticker(sym), gsec, fin_mode, tl, eq, fo)
-                    if snap.price is None:
-                        raise ValueError("no price data")
-                    d, p = snap.data, res["pillars"]
-                    done[sym] = {"Symbol": sym, "Company": info.loc[sym, "Company"], "Sector": info.loc[sym, "Sector"],
-                                 "Mcap ₹ cr": (d.get("mcap") or np.nan) / 1e7, "Overall %": res["composite"],
-                                 "Outlook": band(res["composite"])[0], "Coverage %": res["coverage"],
-                                 **{f"{PILLAR_ICON[k]} {k}": p[k] for k in E.PILLARS},
-                                 "EPS growth %": d.get("fwd_growth"), "EPS revision 90d %": d.get("eps_rev90"),
-                                 "Target upside %": snap.values.get("G1"), "vs 200-DMA %": snap.values.get("M3")}
-                    failed.pop(sym, None); streak = 0
-                except Exception as e:
-                    failed[sym] = str(e)[:80]; streak += 1
-                    if streak >= 5:                      # 5 failures in a row usually means Yahoo is throttling: back off
-                        prog.progress(i / len(symbols), text=f"Several failures in a row — backing off for {rest * 2}s…")
-                        time.sleep(rest * 2); streak = 0
-                time.sleep(pause * slow * (0.8 + 0.4 * np.random.rand()))   # jittered pause
-                if i % batch == 0 and i < len(symbols):
-                    prog.progress(i / len(symbols), text=f"Resting {rest}s after {i} stocks (rate-limit protection)…")
-                    time.sleep(rest)
-        finally:
-            if saved_dhan: st.session_state["dhan_cfg"] = saved_dhan
-            prog.empty()
-
+    if pause_btn:
+        st.session_state["sec_active"] = False; active = False
     if start and pending:
-        _run(pending)
-        st.success(f"Scan finished · {len(done)} stocks scored · {len(failed)} failed.")
+        st.session_state.update(sec_active=True, sec_t0=time.time(), sec_n=0, sec_streak=0, sec_slow=1.0); active = True
     if retry and failed:
-        time.sleep(5); _run(list(failed), slow=2.0)
+        for k_ in [k_ for k_ in failed if k_ in set(todo_all["Symbol"])]: failed.pop(k_)
+        pending = [s_ for s_ in todo_all["Symbol"] if s_ not in done and s_ not in failed]
+        st.session_state.update(sec_active=True, sec_t0=time.time(), sec_n=0, sec_streak=0, sec_slow=2.0); active = True
+    prog_box = st.empty()          # progress bar lives here; the scan itself runs at the end of this tab
+    if active:
+        st.info("⏳ Scan running in short chunks of 15 stocks. Results and downloads below refresh after every chunk. "
+                "Clicking elsewhere no longer stops it for good — it carries on automatically; use **Pause** to stop. "
+                "If the progress bar freezes (connection dropped), press **Start / resume**.")
 
     if failed:
         with st.expander(f"⚠️ {len(failed)} stocks could not be scored"):
             st.dataframe(pd.DataFrame([{"Symbol": k, "Reason": v} for k, v in failed.items()]), hide_index=True, width="stretch")
-    if not done:
-        st.info("No results yet. Press **Start** — you can interrupt at any time and resume later in this session; "
-                "any other click in the app pauses the scan.")
-        return
+    if done:
+        _sector_results(done, failed, todo_all, pick)
+    else:
+        st.info("No results yet. Press **Start / resume scan**.")
 
+    # ── chunked scan: a short run, then an automatic rerun. Keeps each script run brief so a dropped
+    #    connection or a click costs at most one chunk, and partial results stay downloadable.
+    if not active:
+        return
+    chunk = pending[:15]
+    saved_dhan = None if use_dhan else st.session_state.pop("dhan_cfg", None)   # skip Dhan unless asked
+    total = len(pending) + st.session_state.get("sec_n", 0)
+    try:
+        for sym in chunk:
+            n = st.session_state["sec_n"]
+            el = time.time() - st.session_state["sec_t0"]
+            eta = el / n * (total - n) if n else 0
+            prog_box.progress(min(1.0, n / max(1, total)),
+                              text=f"{sym} ({n + 1}/{total}) · elapsed {el/60:.0f} min · ~{eta/60:.0f} min left")
+            try:
+                snap, res, _ = scan(E.norm_ticker(sym), gsec, fin_mode, tl, eq, fo)
+                if snap.price is None:
+                    raise ValueError("no price data")
+                d, p = snap.data, res["pillars"]
+                done[sym] = {"Symbol": sym, "Company": info.loc[sym, "Company"], "Sector": info.loc[sym, "Sector"],
+                             "Mcap ₹ cr": (d.get("mcap") or np.nan) / 1e7, "Overall %": res["composite"],
+                             "Outlook": band(res["composite"])[0], "Coverage %": res["coverage"],
+                             **{f"{PILLAR_ICON[k]} {k}": p[k] for k in E.PILLARS},
+                             "EPS growth %": d.get("fwd_growth"), "EPS revision 90d %": d.get("eps_rev90"),
+                             "Target upside %": snap.values.get("G1"), "vs 200-DMA %": snap.values.get("M3")}
+                failed.pop(sym, None); st.session_state["sec_streak"] = 0
+            except Exception as e:
+                failed[sym] = str(e)[:80]; st.session_state["sec_streak"] += 1
+                if st.session_state["sec_streak"] >= 5:      # 5 failures in a row usually means Yahoo is throttling
+                    prog_box.progress(min(1.0, n / max(1, total)), text=f"Several failures in a row — backing off for {rest * 2}s…")
+                    time.sleep(rest * 2); st.session_state["sec_streak"] = 0
+            st.session_state["sec_n"] += 1
+            time.sleep(pause * st.session_state.get("sec_slow", 1.0) * (0.8 + 0.4 * np.random.rand()))   # jittered pause
+            if st.session_state["sec_n"] % batch == 0:
+                prog_box.progress(min(1.0, st.session_state["sec_n"] / max(1, total)),
+                                  text=f"Resting {rest}s after {st.session_state['sec_n']} stocks (rate-limit protection)…")
+                time.sleep(rest)
+    finally:
+        if saved_dhan: st.session_state["dhan_cfg"] = saved_dhan
+    if not [s_ for s_ in todo_all["Symbol"] if s_ not in done and s_ not in failed]:
+        st.session_state["sec_active"] = False
+        st.toast(f"Scan finished · {len(done)} scored · {len(failed)} failed")
+    st.rerun()
+
+
+def _sector_results(done, failed, todo_all, pick):
     stocks = pd.DataFrame(list(done.values()))
     stocks = stocks[stocks["Symbol"].isin(todo_all["Symbol"])] if pick else stocks
     sec = _sector_table(stocks)
@@ -1225,7 +1273,9 @@ def sector_tab(gsec, fin_mode, tl, eq, fo):
     worst = solid.iloc[-1] if len(solid) else None
     tiles = [f'<div class="verdict" style="background:{col}"><div class="lab">NIFTY 500 scan (mcap-weighted)</div>'
              f'<div class="val">{pct(total)}</div><div class="note">{lab}</div></div>',
-             kpi("Stocks scored", f"{len(stocks)} / {len(todo_all)}", f"{len(failed)} failed"),
+             kpi("Stocks scored", f"{len(stocks)} / {len(todo_all)}",
+                 f"{sum(1 for s_ in todo_all['Symbol'] if s_ in failed)} failed · "
+                 f"{sum(1 for s_ in todo_all['Symbol'] if s_ not in done and s_ not in failed)} not scanned yet"),
              kpi("Breadth", f"{(stocks['Overall %'] >= 15).mean() * 100:.0f}% positive",
                  f"{(stocks['Overall %'] <= -15).mean() * 100:.0f}% negative")]
     if best is not None:
@@ -1316,9 +1366,9 @@ def sector_tab(gsec, fin_mode, tl, eq, fo):
               f"# Created by {AUTHOR}. (c) 2026 {AUTHOR}. {DISCLAIMER_SHORT}\n")
     d1, d2, d3 = st.columns(3)
     d1.download_button("⬇️ Stock-level CSV (keep for next comparison)", (header + stocks.to_csv(index=False)).encode("utf-8"),
-                       f"nifty500_stocks_{stamp}.csv", "text/csv", width="stretch")
+                       f"nifty500_stocks_{stamp}.csv", "text/csv", width="stretch", on_click="ignore")
     d2.download_button("⬇️ Sector CSV", (header + sec.to_csv(index=False)).encode("utf-8"),
-                       f"nifty500_sectors_{stamp}.csv", "text/csv", width="stretch")
+                       f"nifty500_sectors_{stamp}.csv", "text/csv", width="stretch", on_click="ignore")
     try:
         import io
         buf = io.BytesIO()
@@ -1333,7 +1383,7 @@ def sector_tab(gsec, fin_mode, tl, eq, fo):
                 for col_cells in ws.columns:
                     ws.column_dimensions[col_cells[0].column_letter].width = min(42, max(10, max(len(str(c_.value or "")) for c_ in col_cells) + 2))
         d3.download_button("⬇️ Colour-coded Excel", buf.getvalue(), f"nifty500_sector_view_{stamp}.xlsx",
-                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch", on_click="ignore")
     except Exception as e:
         d3.caption(f"Excel export unavailable: {e}")
 

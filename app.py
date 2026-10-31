@@ -1467,6 +1467,40 @@ def footer():
                 unsafe_allow_html=True)
 
 # ── main ──────────────────────────────────────────────────────────────────────
+# ── owner access (NIFTY 500 sector scan is owner-only) ───────────────────────
+def owner_panel() -> bool:
+    """Sidebar login for the app owner. The password lives only in Streamlit Secrets as OWNER_PASSWORD."""
+    import hmac
+    try:
+        secret = str(st.secrets.get("OWNER_PASSWORD", "") or "")
+    except Exception:
+        secret = ""
+    sb = st.sidebar
+    with sb.expander("🔐 Owner", expanded=False):
+        if st.session_state.get("owner"):
+            st.success("Owner mode on — 🏭 Sectors tab unlocked.")
+            if st.button("Log out", key="owner_logout", width="stretch"):
+                st.session_state["owner"] = False
+                st.session_state["sec_active"] = False          # stop any running sector scan
+                st.rerun()
+        elif not secret:
+            st.caption("Owner tools are disabled: add OWNER_PASSWORD to this app's Secrets to enable them.")
+        elif st.session_state.get("owner_tries", 0) >= 5:
+            st.error("Too many wrong attempts. Reload the page to try again.")
+        else:
+            with st.form("owner_form", border=False):
+                pw = st.text_input("Owner password", type="password", key="owner_pw")
+                go_ = st.form_submit_button("Unlock", width="stretch")
+            if go_:
+                if hmac.compare_digest(pw.encode(), secret.encode()):
+                    st.session_state["owner"] = True; st.session_state["owner_tries"] = 0
+                    st.rerun()
+                else:
+                    st.session_state["owner_tries"] = st.session_state.get("owner_tries", 0) + 1
+                    time.sleep(1.5)                                   # slows down password guessing
+                    st.error("Wrong password.")
+    return bool(st.session_state.get("owner"))
+
 def main():
     st.markdown(CSS, unsafe_allow_html=True)
     hero()
@@ -1474,13 +1508,17 @@ def main():
     if not disclaimer_gate():
         footer(); return
     eq, fo = nse_data(eq_files, fo_files)
-    t1, t2, t5, t6, t3, t4 = st.tabs(["🔍 Single company", "📋 Watchlist", "💼 Portfolio", "🏭 Sectors", "🧭 Method & legal", "👨‍⚕️ About"])
-    with t1: single_tab(gsec, fin_mode, tl, eq, fo, use_news)
-    with t2: watch_tab(gsec, fin_mode, tl, eq, fo)
-    with t5: portfolio_tab(gsec, fin_mode, tl, eq, fo)
-    with t6: sector_tab(gsec, fin_mode, tl, eq, fo)
-    with t3: method_tab()
-    with t4: about_tab()
+    is_owner = owner_panel()
+    names = ["🔍 Single company", "📋 Watchlist", "💼 Portfolio"] + (["🏭 Sectors (owner)"] if is_owner else []) + \
+            ["🧭 Method & legal", "👨‍⚕️ About"]
+    tabs = dict(zip(names, st.tabs(names)))
+    with tabs["🔍 Single company"]: single_tab(gsec, fin_mode, tl, eq, fo, use_news)
+    with tabs["📋 Watchlist"]: watch_tab(gsec, fin_mode, tl, eq, fo)
+    with tabs["💼 Portfolio"]: portfolio_tab(gsec, fin_mode, tl, eq, fo)
+    if is_owner:
+        with tabs["🏭 Sectors (owner)"]: sector_tab(gsec, fin_mode, tl, eq, fo)
+    with tabs["🧭 Method & legal"]: method_tab()
+    with tabs["👨‍⚕️ About"]: about_tab()
     footer()
 
 if __name__ == "__main__":

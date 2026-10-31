@@ -49,7 +49,7 @@ On your first visit, read the disclaimer and tick *I have read, understood and a
 
 4. **Portfolio:** upload your holdings as CSV or Excel (broker exports usually work; the app looks for a symbol, quantity and average-cost column and skips title rows). Fix any symbol the app flags under *Analyse as*, then press **🧮 Analyse portfolio**. You get a value-weighted portfolio score, a portfolio map, outlook and sector breakdowns, value-weighted pillars, a score-vs-P&L chart, a colour-coded holding table with mechanical flags, and CSV / colour-coded Excel downloads.
 
-5. **Sectors:** press **🏭 Start / resume NIFTY 500 scan** (or pick a few sectors first). A full scan takes 30–60 minutes; any other click pauses it and **Start / resume** continues where it stopped. You get sector scores (market-cap-weighted and equal-weight), breadth, a sector × pillar heat-map, a drill-down per sector and CSV / Excel downloads. Keep the *stock-level CSV* and upload it next time to see each sector's change and a sector-rotation chart. Replace `nifty500_constituents.csv` (NSE Indices' `ind_nifty500list.csv`) after each half-yearly rebalance.
+5. **Sectors (owner only):** unlock it under **🔐 Owner** in the sidebar (see *Owner access* below). Then press **🏭 Start / resume NIFTY 500 scan** (or pick a few sectors first). A full scan takes 30–60 minutes. It runs in chunks of 15 stocks and carries on automatically after clicks; use **Pause** to stop. If the page is refreshed or the connection drops, upload the last stock-level CSV or Excel file under **📂 Resume** and press **Start / resume**. You get sector scores (market-cap-weighted and equal-weight), breadth, a sector × pillar heat-map, a drill-down per sector and CSV / Excel downloads. Keep the *stock-level CSV* and upload it next time to see each sector's change and a sector-rotation chart. Replace `nifty500_constituents.csv` (NSE Indices' `ind_nifty500list.csv`) after each half-yearly rebalance.
 
 **Trendlyne file tip:** include the **NSE code** column in your Trendlyne view. Without it the app matches by company name, which misses short names such as "L&T".
 
@@ -77,3 +77,12 @@ AUTHOR = "Dr Shantanu Samanta"
 AUTHOR_LINE = "Physician, Kolkata · Quantitative market analyst & trading-tools developer"
 ```
 Edit `AUTHOR_LINE` to add degrees or registrations. If you ever become SEBI-registered, also update section 2 of `DISCLAIMER_FULL` with the registration number.
+
+## Owner access (NIFTY 500 sector scan)
+The 🏭 Sectors tab runs a 500-stock scan, so it is hidden from visitors. To use it yourself:
+1. In Streamlit Cloud open your app → **Settings → Secrets** and add a line
+   ```
+   OWNER_PASSWORD = "choose-a-long-password"
+   ```
+2. In the app, open **🔐 Owner** in the sidebar, type the password and press **Unlock**. The tab appears for your browser session only; **Log out** hides it again and stops any running scan.
+3. Without `OWNER_PASSWORD` in Secrets the tab is unavailable to everyone. Never put the password in `app.py` or on GitHub.
